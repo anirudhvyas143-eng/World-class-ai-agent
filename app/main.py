@@ -4,36 +4,36 @@ import uvicorn
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import json
-import psycopg2
 import requests
 from datetime import datetime, timedelta
+from supabase import create_client, Client
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ---------------- Supabase Setup ----------------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ---------------- Environment / Other APIs ----------------
 TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 MAILCHIMP_KEY = os.getenv("MAILCHIMP_API_KEY")
 CALENDLY_KEY = os.getenv("CALENDLY_API_KEY")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT","You are RE-DealAgent")
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are RE-DealAgent")
 
 app = FastAPI(title="RE-DealAgent")
 
+# ---------------- Pydantic Model ----------------
 class LeadIn(BaseModel):
     source: str
     campaign_id: str = None
     lead: dict
     utm: dict = None
 
+# ---------------- Lead Persistence ----------------
 def persist_lead(payload):
-    conn = get_conn()
-    cur = conn.cursor()
-    lead = payload.get('lead',{})
+    lead = payload.get('lead', {})
     name = lead.get('name')
     phone = lead.get('phone')
     email = lead.get('email')
@@ -41,23 +41,32 @@ def persist_lead(payload):
     intent = lead.get('use_case') or lead.get('intent')
     source = payload.get('source')
     payload_json = json.dumps(payload)
-    cur.execute("""
-      INSERT INTO leads (source, source_payload, name, phone, email, budget, intent)
-      VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
-    """,(source,payload_json,name,phone,email,budget,intent))
-    lead_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return lead_id
 
+    # Insert into Supabase
+    response = supabase.table("leads").insert([
+        {
+            "source": source,
+            "source_payload": payload_json,
+            "name": name,
+            "phone": phone,
+            "email": email,
+            "budget": budget,
+            "intent": intent
+        }
+    ]).execute()
+
+    if response.data and len(response.data) > 0:
+        return response.data[0]["id"]
+    return None
+
+# ---------------- Lead Scoring ----------------
 def compute_score(lead):
     score = 0
     try:
         budget = int(lead.get('budget') or 0)
     except:
         budget = 0
-    ASKING_PRICE_PER_ACRE = 60000000  # adjust later per property
+    ASKING_PRICE_PER_ACRE = 60000000  # adjust per property
     if budget >= ASKING_PRICE_PER_ACRE * 0.5:
         score += 40
     timeline = lead.get('timeline', '')
@@ -72,6 +81,7 @@ def compute_score(lead):
         score += 10
     return min(100, score)
 
+# ---------------- Notifications ----------------
 def send_slack(msg):
     if not SLACK_WEBHOOK:
         print("No SLACK_WEBHOOK set.")
@@ -97,22 +107,20 @@ def send_sms(to, body):
         print("Twilio error:", e)
 
 def create_calendly_event(name, email, phone, start_iso):
-    # Placeholder; replace with Calendly API call in next steps
+    # Placeholder; replace with Calendly API call later
     return {"booking_url":"https://calendly.com/your/slot","event_id":"evt_stub"}
 
+# ---------------- Webhook Endpoint ----------------
 @app.post("/webhook/lead")
 async def webhook_lead(payload: LeadIn, background_tasks: BackgroundTasks):
     payload_dict = payload.dict()
     lead_id = persist_lead(payload_dict)
-    score = compute_score(payload_dict.get('lead',{}))
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE leads SET lead_score=%s, updated_at=now() WHERE id=%s",(score,lead_id))
-    conn.commit()
-    cur.close()
-    conn.close()
+    lead = payload_dict.get('lead', {})
+    score = compute_score(lead)
 
-    lead = payload_dict.get('lead',{})
+    # Update score in Supabase
+    supabase.table("leads").update({"lead_score": score, "updated_at": datetime.utcnow().isoformat()}).eq("id", lead_id).execute()
+
     phone = lead.get('phone')
     name = lead.get('name','')
 
@@ -129,12 +137,15 @@ async def webhook_lead(payload: LeadIn, background_tasks: BackgroundTasks):
 
     return {"lead_id": lead_id, "score": score}
 
+# ---------------- Health & Root ----------------
 @app.get("/health")
 def health():
     return {"status":"ok", "time": datetime.utcnow().isoformat()}
-    @app.get("/")
+
+@app.get("/")
 async def root():
     return {"message": "World Class AI Agent is running!"}
 
+# ---------------- Run ----------------
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
