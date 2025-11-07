@@ -132,6 +132,9 @@ async def webhook_lead(payload: LeadIn, background_tasks: BackgroundTasks):
 @app.get("/health")
 def health():
     return {"status":"ok", "time": datetime.utcnow().isoformat()}
+    @app.get("/")
+async def root():
+    return {"message": "World Class AI Agent is running!"}
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000)
